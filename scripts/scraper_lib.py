@@ -10,11 +10,15 @@ import re
 import time
 import requests
 
-BASE_URL = "https://old.mse.mn/en/company/{id}"
+BASE_URL = "https://members.mse.mn/en/company/{id}"
 TIMEOUT = 20
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; research-scraper/1.0)"
 }
+
+# NOTE: internal company IDs on members.mse.mn are DIFFERENT from the old
+# old.mse.mn IDs (e.g. TTL was 458 on old.mse.mn, but is 510 here). Any
+# previously-built ticker_ids.json must be regenerated against this domain.
 
 SECTION_MARKER = "Trading history of Block Trade"
 

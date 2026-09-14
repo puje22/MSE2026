@@ -52,7 +52,7 @@ TARGET_TICKERS = {
 }
 
 BASE_URL = "https://old.mse.mn/en/company/{id}"
-ID_RANGE = range(1, 700)          # widen if some tickers aren't found
+ID_RANGE = range(1, 3000)          # widen if some tickers aren't found
 REQUEST_DELAY = 0.3               # seconds between requests (politeness)
 MAX_WORKERS = 6                   # parallel requests; lower if you get blocked
 TIMEOUT = 20
