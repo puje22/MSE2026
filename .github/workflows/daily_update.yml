@@ -4,11 +4,11 @@ on:
   schedule:
     # 09:00 UTC = 17:00 Ulaanbaatar time (UTC+8), a few hours after MSE's
     # trading session closes. Adjust if MSE's hours or your timezone differ.
-    - cron: '0 9 * * *'
-  workflow_dispatch: {}   # lets you trigger it manually from the Actions tab
+    - cron: "0 9 * * *"
+  workflow_dispatch: {} # lets you trigger it manually from the Actions tab
 
 permissions:
-  contents: write   # needed so the workflow can commit the updated CSV back
+  contents: write # needed so the workflow can commit the updated CSV back
 
 jobs:
   update:
@@ -20,7 +20,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -37,5 +37,9 @@ jobs:
             echo "No new data today, nothing to commit."
           else
             git commit -m "Daily MSE data update: $(date -u +'%Y-%m-%d')"
+            # Pull any commits that landed after this job's checkout (e.g. a
+            # manual push happening around the same time) before pushing,
+            # so a race condition doesn't fail the whole job.
+            git pull --rebase origin main
             git push
           fi
