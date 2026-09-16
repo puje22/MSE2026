@@ -40,16 +40,21 @@ def num(s):
     return float(s.replace(",", ""))
 
 
-def fetch(company_id, delay=0.3):
+def fetch(company_id, delay=0.3, retries=3, retry_backoff=2.0):
     url = BASE_URL.format(id=company_id)
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-        resp.raise_for_status()
-    except requests.RequestException:
-        return None
-    finally:
-        time.sleep(delay)
-    return resp.text
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+            resp.raise_for_status()
+            time.sleep(delay)
+            return resp.text
+        except requests.RequestException as e:
+            last_exc = e
+            if attempt < retries - 1:
+                time.sleep(retry_backoff * (attempt + 1))  # 2s, 4s, ...
+    # All retries exhausted
+    return None
 
 
 def parse_page(html):
