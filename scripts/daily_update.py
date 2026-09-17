@@ -17,11 +17,12 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
-from scraper_lib import fetch, parse_page, parse_financials  # noqa: E402
+from scraper_lib import fetch, parse_page, parse_financials, parse_dividend_announcements  # noqa: E402
 
 TICKER_IDS_FILE = os.path.join(os.path.dirname(__file__), "ticker_ids.json")
 MASTER_CSV = os.path.join(os.path.dirname(__file__), "..", "data", "mse_daily_prices.csv")
 FINANCIALS_CSV = os.path.join(os.path.dirname(__file__), "..", "data", "mse_financials.csv")
+DIVIDENDS_CSV = os.path.join(os.path.dirname(__file__), "..", "data", "mse_dividends.csv")
 
 FIELDNAMES = ["ticker", "company_name", "date", "open", "high", "low",
               "close", "volume", "value"]
@@ -32,6 +33,8 @@ FINANCIALS_FIELDNAMES = [
     "gross_profit", "net_income", "book_value_per_share", "roa", "roe",
     "rota", "eps", "pe_ratio",
 ]
+
+DIVIDENDS_FIELDNAMES = ["ticker", "company_name", "date", "headline"]
 
 
 def load_ticker_ids():
@@ -79,12 +82,34 @@ def save_financials(rows):
             writer.writerow(row)
 
 
+def load_dividends():
+    """Return dict of (ticker, date) -> row dict."""
+    rows = {}
+    if os.path.exists(DIVIDENDS_CSV):
+        with open(DIVIDENDS_CSV, "r", newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                rows[(row["ticker"], row["date"])] = row
+    return rows
+
+
+def save_dividends(rows):
+    os.makedirs(os.path.dirname(DIVIDENDS_CSV), exist_ok=True)
+    ordered = sorted(rows.values(), key=lambda r: (r["ticker"], r["date"]), reverse=True)
+    with open(DIVIDENDS_CSV, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=DIVIDENDS_FIELDNAMES)
+        writer.writeheader()
+        for row in ordered:
+            writer.writerow(row)
+
+
 def main():
     ticker_ids = load_ticker_ids()
     master = load_master()
     financials = load_financials()
+    dividends = load_dividends()
     before_count = len(master)
     financials_before_count = len(financials)
+    dividends_before_count = len(dividends)
 
     failures = []
     added_per_ticker = {}
@@ -154,8 +179,20 @@ def main():
             }
         financials_added_per_ticker[ticker] = fin_added
 
+        # Dividend announcement dates — also from the same page, no extra request.
+        div_rows = parse_dividend_announcements(html)
+        for dr in div_rows:
+            key = (ticker, dr["date"])
+            dividends[key] = {
+                "ticker": ticker,
+                "company_name": name,
+                "date": dr["date"],
+                "headline": dr["headline"],
+            }
+
     save_master(master)
     save_financials(financials)
+    save_dividends(dividends)
 
     print(f"Master rows before: {before_count}, after: {len(master)}")
     for ticker, added in added_per_ticker.items():
@@ -166,6 +203,9 @@ def main():
     for ticker, added in financials_added_per_ticker.items():
         if added:
             print(f"  {ticker}: +{added} new/updated financial years")
+
+    print(f"Dividend announcement rows before: {dividends_before_count}, "
+          f"after: {len(dividends)}")
 
     if failures:
         print(f"WARNING: failed to fetch/parse: {failures}")

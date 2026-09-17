@@ -148,6 +148,33 @@ def parse_financials(html):
     return results
 
 
+ANNOUNCEMENT_RE = re.compile(
+    r"(\d+)\s+([A-Z][A-Za-z0-9 '\"\u201c\u201d,\.\-]{5,150}?)\s+"
+    r"(\d{4}-\d{2}-\d{2})\s+\d{2}:\d{2}:\d{2}"
+)
+
+
+def parse_dividend_announcements(html):
+    """
+    Best-effort extraction of dividend-related announcement headlines and
+    dates from the page's news/announcements feed. Returns a list of
+    {headline, date} dicts, newest first. This gives DECLARATION DATES only —
+    the announcement text on MSE's site has the actual per-share amount,
+    which isn't available here in structured form.
+    """
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, "lxml")
+    text = soup.get_text(" ", strip=True)
+
+    results = []
+    for m in ANNOUNCEMENT_RE.finditer(text):
+        _, headline, date = m.groups()
+        if "DIVIDEND" in headline.upper():
+            results.append({"headline": headline.strip(), "date": date})
+    return results
+
+
 def parse_page(html):
     """Return (ticker, company_name, rows) or None if not a valid company page."""
     from bs4 import BeautifulSoup

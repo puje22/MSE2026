@@ -66,25 +66,61 @@ filtered = df[
 
 # ---- Latest snapshot table --------------------------------------------------
 
+
+def trailing_pct_change(ticker_df, days):
+    ticker_df = ticker_df.sort_values("date")
+    if ticker_df.empty:
+        return None
+    latest_date = ticker_df["date"].iloc[-1]
+    latest_close = ticker_df["close"].iloc[-1]
+    target_date = latest_date - pd.Timedelta(days=days)
+    hist = ticker_df[ticker_df["date"] <= target_date]
+    if hist.empty:
+        return None
+    base_close = hist["close"].iloc[-1]
+    return (latest_close / base_close - 1) * 100 if base_close else None
+
+
+def ytd_pct_change(ticker_df):
+    ticker_df = ticker_df.sort_values("date")
+    if ticker_df.empty:
+        return None
+    latest_date = ticker_df["date"].iloc[-1]
+    latest_close = ticker_df["close"].iloc[-1]
+    year_start = pd.Timestamp(year=latest_date.year, month=1, day=1)
+    hist = ticker_df[ticker_df["date"] >= year_start]
+    if hist.empty:
+        return None
+    base_close = hist.iloc[0]["close"]
+    return (latest_close / base_close - 1) * 100 if base_close else None
+
+
 st.subheader("Latest close")
-latest = (
-    filtered.sort_values("date")
-    .groupby("ticker")
-    .tail(2)
-    .groupby("ticker")
-    .apply(lambda g: pd.Series({
-        "company_name": g["company_name"].iloc[-1],
-        "date": g["date"].iloc[-1].date(),
-        "close": g["close"].iloc[-1],
-        "change_%": (
-            round((g["close"].iloc[-1] / g["close"].iloc[-2] - 1) * 100, 2)
-            if len(g) > 1 else None
-        ),
-        "volume": g["volume"].iloc[-1],
-    }))
-    .reset_index()
-)
+rows = []
+for ticker in selected:
+    tfull = df[df["ticker"] == ticker].sort_values("date")
+    if tfull.empty:
+        continue
+    last_row = tfull.iloc[-1]
+    prev_row = tfull.iloc[-2] if len(tfull) > 1 else None
+    day_pct = (last_row["close"] / prev_row["close"] - 1) * 100 if prev_row is not None and prev_row["close"] else None
+    rows.append({
+        "ticker": ticker,
+        "company_name": last_row["company_name"],
+        "date": last_row["date"].date(),
+        "close": last_row["close"],
+        "change_%": round(day_pct, 2) if day_pct is not None else None,
+        "30d_%": (lambda v: round(v, 2) if v is not None else None)(trailing_pct_change(tfull, 30)),
+        "90d_%": (lambda v: round(v, 2) if v is not None else None)(trailing_pct_change(tfull, 90)),
+        "ytd_%": (lambda v: round(v, 2) if v is not None else None)(ytd_pct_change(tfull)),
+        "volume": last_row["volume"],
+    })
+latest = pd.DataFrame(rows)
 st.dataframe(latest, use_container_width=True, hide_index=True)
+st.caption(
+    "30d/90d/YTD % change are based on each ticker's full price history "
+    "(not limited by the date-range filter above)."
+)
 
 # ---- Price chart ------------------------------------------------------------
 
@@ -164,11 +200,16 @@ else:
         if avg_vol_30d and avg_vol_30d > 0 else None
     )
 
-    # Moving averages
-    tdf["ma50"] = tdf["close"].rolling(50, min_periods=1).mean()
-    tdf["ma200"] = tdf["close"].rolling(200, min_periods=1).mean()
-    ma50_latest = tdf["ma50"].iloc[-1]
-    ma200_latest = tdf["ma200"].iloc[-1]
+    # Moving averages: simple (SMA) at 20/50/100/200 days, plus exponentially
+    # weighted (EMA) at 20/50 days — EMA weights recent prices more heavily.
+    tdf["sma20"] = tdf["close"].rolling(20, min_periods=1).mean()
+    tdf["sma50"] = tdf["close"].rolling(50, min_periods=1).mean()
+    tdf["sma100"] = tdf["close"].rolling(100, min_periods=1).mean()
+    tdf["sma200"] = tdf["close"].rolling(200, min_periods=1).mean()
+    tdf["ema20"] = tdf["close"].ewm(span=20, adjust=False).mean()
+    tdf["ema50"] = tdf["close"].ewm(span=50, adjust=False).mean()
+    sma50_latest = tdf["sma50"].iloc[-1]
+    sma200_latest = tdf["sma200"].iloc[-1]
 
     # ---- Metric row ----
     c1, c2, c3, c4 = st.columns(4)
@@ -195,20 +236,34 @@ else:
     # ---- Price chart with 52w high/low and moving averages ----
     st.subheader(f"{overview_ticker} — price, moving averages & 52-week range")
     fig3 = go.Figure()
-    fig3.add_trace(go.Scatter(x=tdf["date"], y=tdf["close"], name="Close", mode="lines"))
-    fig3.add_trace(go.Scatter(x=tdf["date"], y=tdf["ma50"], name="50-day MA",
+    fig3.add_trace(go.Scatter(x=tdf["date"], y=tdf["close"], name="Close", mode="lines",
+                               line=dict(width=2)))
+    fig3.add_trace(go.Scatter(x=tdf["date"], y=tdf["sma20"], name="SMA 20",
                                mode="lines", line=dict(dash="dot")))
-    fig3.add_trace(go.Scatter(x=tdf["date"], y=tdf["ma200"], name="200-day MA",
+    fig3.add_trace(go.Scatter(x=tdf["date"], y=tdf["sma50"], name="SMA 50",
+                               mode="lines", line=dict(dash="dot")))
+    fig3.add_trace(go.Scatter(x=tdf["date"], y=tdf["sma100"], name="SMA 100",
                                mode="lines", line=dict(dash="dash")))
+    fig3.add_trace(go.Scatter(x=tdf["date"], y=tdf["sma200"], name="SMA 200",
+                               mode="lines", line=dict(dash="dash")))
+    fig3.add_trace(go.Scatter(x=tdf["date"], y=tdf["ema20"], name="EMA 20 (weighted)",
+                               mode="lines", line=dict(dash="dashdot")))
+    fig3.add_trace(go.Scatter(x=tdf["date"], y=tdf["ema50"], name="EMA 50 (weighted)",
+                               mode="lines", line=dict(dash="dashdot")))
     fig3.add_hline(y=high_52w, line_dash="dot", line_color="green",
                     annotation_text="52w high")
     fig3.add_hline(y=low_52w, line_dash="dot", line_color="red",
                     annotation_text="52w low")
     fig3.update_layout(
-        height=450, xaxis_title="Date", yaxis_title="Price (MNT)",
+        height=500, xaxis_title="Date", yaxis_title="Price (MNT)",
         margin=dict(l=10, r=10, t=30, b=10),
     )
     st.plotly_chart(fig3, use_container_width=True)
+    st.caption(
+        "SMA = simple moving average (equal-weighted). EMA = exponentially "
+        "weighted moving average (recent prices weighted more heavily, reacts "
+        "faster to new price moves). Click legend items to toggle lines on/off."
+    )
 
     # ---- Volume chart ----
     st.subheader(f"{overview_ticker} — daily volume")
@@ -224,12 +279,18 @@ else:
     st.subheader("Technical snapshot")
     signals = []
     signals.append(
-        f"Price is {'above' if latest['close'] > ma50_latest else 'below'} "
-        f"its 50-day moving average ({ma50_latest:,.0f})."
+        f"Price is {'above' if latest['close'] > sma50_latest else 'below'} "
+        f"its 50-day moving average ({sma50_latest:,.0f})."
     )
     signals.append(
-        f"Price is {'above' if latest['close'] > ma200_latest else 'below'} "
-        f"its 200-day moving average ({ma200_latest:,.0f})."
+        f"Price is {'above' if latest['close'] > sma200_latest else 'below'} "
+        f"its 200-day moving average ({sma200_latest:,.0f})."
+    )
+    sma20_latest = tdf["sma20"].iloc[-1]
+    signals.append(
+        f"Short-term (20-day) average is {'above' if sma20_latest > sma50_latest else 'below'} "
+        f"the medium-term (50-day) average — sometimes read as a "
+        f"{'bullish' if sma20_latest > sma50_latest else 'bearish'} crossover signal."
     )
     signals.append(
         f"Trading {range_position:.0f}% of the way up its 52-week range "
@@ -265,6 +326,19 @@ else:
         )
     else:
         latest_fin = ticker_fin.iloc[-1]
+        latest_fin_year = int(latest_fin["year"])
+        current_year = pd.Timestamp.now().year
+        years_behind = current_year - latest_fin_year
+
+        st.info(
+            f"**These are actual reported/audited figures, not projections or "
+            f"estimates.** The most recent year shown is fiscal year "
+            f"**{latest_fin_year}** — companies typically file annual reports "
+            f"several months after fiscal year-end, so {current_year} figures "
+            f"won't appear here until filed"
+            + (f" (currently {years_behind} year(s) behind the calendar year)."
+               if years_behind > 0 else ".")
+        )
         f1, f2, f3, f4 = st.columns(4)
         f1.metric("EPS (latest fiscal year)",
                    f"{latest_fin['eps']:,.0f}" if pd.notna(latest_fin['eps']) else "n/a")
@@ -313,6 +387,28 @@ else:
             "Source: members.mse.mn company financial statements. Figures are "
             "as filed and may lag the current fiscal year. Not financial advice."
         )
+
+    # ---- Dividend announcement history (dates only, not per-share amounts) ----
+    st.subheader("Dividend announcement history")
+    try:
+        div_df = pd.read_csv("data/mse_dividends.csv")
+    except FileNotFoundError:
+        div_df = pd.DataFrame()
+
+    ticker_div = div_df[div_df["ticker"] == overview_ticker] if not div_df.empty else pd.DataFrame()
+    if ticker_div.empty:
+        st.info(f"No dividend declaration announcements found for {overview_ticker}.")
+    else:
+        st.dataframe(
+            ticker_div[["date", "headline"]].sort_values("date", ascending=False),
+            use_container_width=True, hide_index=True,
+        )
+    st.caption(
+        "These are declaration dates pulled from MSE announcement headlines — "
+        "not per-share dividend amounts, which aren't available in structured "
+        "form from this data source. See the original MSE announcement for the "
+        "exact amount declared."
+    )
 
 # ---- Raw data / download -----------------------------------------------------
 
