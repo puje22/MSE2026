@@ -2,9 +2,15 @@ name: Daily MSE Data Update
 
 on:
   schedule:
-    # 09:00 UTC = 17:00 Ulaanbaatar time (UTC+8), a few hours after MSE's
-    # trading session closes. Adjust if MSE's hours or your timezone differ.
-    - cron: "0 9 * * *"
+    # 12:00 UTC = 20:00 Ulaanbaatar (UTC+8, no DST) — well after MSE's
+    # trading session closes, primary daily run.
+    - cron: "0 12 * * *"
+    # 00:00 UTC = 08:00 Ulaanbaatar next morning — safety-net catch-up in
+    # case the evening run missed data that MSE published late, or in case
+    # GitHub's scheduler delayed/skipped the evening run entirely (this does
+    # happen on shared runners). Safe to run twice: the updater dedupes by
+    # (ticker, date), so a second run on already-current data just no-ops.
+    - cron: "0 0 * * *"
   workflow_dispatch: {} # lets you trigger it manually from the Actions tab
 
 permissions:
