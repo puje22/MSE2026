@@ -57,6 +57,97 @@ def fetch(company_id, delay=0.3, retries=3, retry_backoff=2.0):
     return None
 
 
+FINANCIALS_MARKER = "Summary of Financials"
+
+YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
+
+FINANCIAL_BLOCK_RE = re.compile(
+    r"Balance sheet\s+"
+    r"Total assets\s+([\d,]+)\s+"
+    r"Total liabilities\s+([\d,]+)\s+"
+    r"Total owner`s equity\s+([\d,]+)\s+"
+    r"Issued shares\s+([\d,]+)\s+"
+    r"Income statement\s+"
+    r"Sales revenue\s+([\d,]+)\s+"
+    r"Cost of sales\s+([\d,]+)\s+"
+    r"Gross profit\s+([\d,]+)\s+"
+    r"Net income\s+([\d,]+)\s+"
+    r"Book value per share\s+([\d,]+)\s+"
+    r"Ratios\s+"
+    r"Return on Assets /ROA/\s*([\d.]+)?\s*"
+    r"Return on Equity /ROE/\s*([\d.]+)?\s*"
+    r"Return on Total Assets /ROTA/\s*([\d.]+)?\s*"
+    r"Earnings per share /EPS/\s+([\d.\-]+)\s+"
+    r"Price earnings ratio \(P/E Ratio\)\s+([\d.\-]+)"
+)
+
+
+def _optional_num(s):
+    return num(s) if s else None
+
+
+def parse_financials(html):
+    """
+    Return a list of dicts, one per fiscal year, newest first:
+        {year, total_assets, total_liabilities, total_equity, issued_shares,
+         sales_revenue, cost_of_sales, gross_profit, net_income,
+         book_value_per_share, roa, roe, rota, eps, pe_ratio}
+    Years with no filed data (all-zero block) are skipped entirely.
+    Returns [] if the page has no financials section.
+    """
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, "lxml")
+    text = soup.get_text(" ", strip=True)
+
+    idx = text.find(FINANCIALS_MARKER)
+    if idx == -1:
+        return []
+    section = text[idx:]
+
+    # Years list sits between "Financial Report" and the first "Balance sheet"
+    report_idx = section.find("Financial Report")
+    first_block_idx = section.find("Balance sheet")
+    if report_idx == -1 or first_block_idx == -1:
+        return []
+    years_text = section[report_idx + len("Financial Report"):first_block_idx]
+    years = [int(m.group(0)) for m in YEAR_RE.finditer(years_text)]
+
+    blocks = list(FINANCIAL_BLOCK_RE.finditer(section))
+
+    results = []
+    for year, m in zip(years, blocks):
+        (total_assets, total_liab, total_equity, issued_shares,
+         sales_rev, cost_of_sales, gross_profit, net_income, bvps,
+         roa, roe, rota, eps, pe) = m.groups()
+
+        total_assets_v = num(total_assets)
+        net_income_v = num(net_income)
+        eps_v = num(eps)
+        # An all-zero block means "no data filed for this year", not a real zero
+        if total_assets_v == 0 and net_income_v == 0 and eps_v == 0:
+            continue
+
+        results.append({
+            "year": year,
+            "total_assets": total_assets_v,
+            "total_liabilities": num(total_liab),
+            "total_equity": num(total_equity),
+            "issued_shares": num(issued_shares),
+            "sales_revenue": num(sales_rev),
+            "cost_of_sales": num(cost_of_sales),
+            "gross_profit": num(gross_profit),
+            "net_income": net_income_v,
+            "book_value_per_share": num(bvps),
+            "roa": _optional_num(roa),
+            "roe": _optional_num(roe),
+            "rota": _optional_num(rota),
+            "eps": eps_v,
+            "pe_ratio": num(pe),
+        })
+    return results
+
+
 def parse_page(html):
     """Return (ticker, company_name, rows) or None if not a valid company page."""
     from bs4 import BeautifulSoup
