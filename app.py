@@ -24,7 +24,7 @@ all_tickers = sorted(df["ticker"].unique())
 
 st.title("Mongolian Stock Exchange — Daily Prices")
 st.caption(
-    f"Data source: old.mse.mn · {df['date'].min().date()} to "
+    f"Data source: members.mse.mn · {df['date'].min().date()} to "
     f"{df['date'].max().date()} · auto-updated daily via GitHub Actions"
 )
 
@@ -64,6 +64,136 @@ filtered = df[
     & (df["date"] >= start)
     & (df["date"] <= end)
 ]
+
+# ---- Signals & Opportunities (scans the FULL watchlist, not just selected) --
+
+st.header("🔔 Signals & Opportunities")
+st.caption(
+    "Scans your full watchlist (all tickers, full history) for notable "
+    "technical patterns — independent of the ticker/date filters above. "
+    "These are objective, rule-based flags, not predictions or "
+    "recommendations. Always do your own research. This isn't financial advice."
+)
+
+
+def _compute_watchlist_signals(ticker_df):
+    tdf = ticker_df.sort_values("date").reset_index(drop=True)
+    if len(tdf) < 30:
+        return None
+
+    tdf["sma50"] = tdf["close"].rolling(50, min_periods=1).mean()
+    tdf["sma200"] = tdf["close"].rolling(200, min_periods=1).mean()
+    gap_pct = (tdf["sma50"] - tdf["sma200"]) / tdf["sma200"] * 100
+
+    latest = tdf.iloc[-1]
+    latest_gap = gap_pct.iloc[-1]
+    lookback_idx = max(0, len(gap_pct) - 6)  # ~5 trading days ago
+    prior_gap = gap_pct.iloc[lookback_idx]
+    converging = abs(latest_gap) < abs(prior_gap)
+
+    # RSI (14-day)
+    delta = tdf["close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(14, min_periods=1).mean()
+    avg_loss = loss.rolling(14, min_periods=1).mean()
+    rs = avg_gain / avg_loss.replace(0, pd.NA)
+    rsi_latest = (100 - (100 / (1 + rs))).fillna(50).iloc[-1]
+
+    # 52-week range position
+    window_start = latest["date"] - pd.Timedelta(days=365)
+    window = tdf[tdf["date"] >= window_start]
+    high52, low52 = window["high"].max(), window["low"].min()
+    range_pos = (latest["close"] - low52) / (high52 - low52) * 100 if high52 > low52 else 50
+
+    # Volume vs 30-day average
+    vol_hist = tdf.iloc[:-1].tail(30)
+    avg_vol = vol_hist["volume"].mean() if len(vol_hist) else None
+    vol_ratio = (latest["volume"] / avg_vol) if avg_vol else None
+
+    flags = []
+
+    # Crossover already happened in the last 5 trading days
+    above = tdf["sma50"] > tdf["sma200"]
+    cross_events = above.astype(int).diff()
+    recent = cross_events.iloc[-5:]
+    if (recent == 1).any():
+        flags.append(("cross", "🟢 Golden Cross (just occurred)",
+                      "SMA50 crossed above SMA200 within the last 5 trading days"))
+    elif (recent == -1).any():
+        flags.append(("cross", "🔴 Death Cross (just occurred)",
+                      "SMA50 crossed below SMA200 within the last 5 trading days"))
+    # Nearing a crossover: gap is small AND shrinking
+    elif abs(latest_gap) < 2 and converging:
+        if latest_gap < 0:
+            flags.append(("cross", "🟡 Golden Cross nearing",
+                          f"SMA50 is {abs(latest_gap):.1f}% below SMA200 and closing the gap"))
+        else:
+            flags.append(("cross", "🟠 Death Cross nearing",
+                          f"SMA50 is {abs(latest_gap):.1f}% above SMA200 and the gap is narrowing"))
+
+    if rsi_latest > 70:
+        flags.append(("rsi", "📈 Overbought (RSI)", f"RSI at {rsi_latest:.0f} (>70)"))
+    elif rsi_latest < 30:
+        flags.append(("rsi", "📉 Oversold (RSI)", f"RSI at {rsi_latest:.0f} (<30)"))
+
+    if range_pos >= 95:
+        flags.append(("range", "🚀 Near 52-week high", f"{range_pos:.0f}% of 52-week range"))
+    elif range_pos <= 5:
+        flags.append(("range", "⚠️ Near 52-week low", f"{range_pos:.0f}% of 52-week range"))
+
+    if vol_ratio and vol_ratio >= 2:
+        flags.append(("volume", "🔊 Volume spike", f"{vol_ratio:.1f}x the 30-day average"))
+
+    if not flags:
+        return None
+    return [
+        {"ticker": None, "category": cat, "signal": label, "detail": detail,
+         "date": latest["date"].date(), "close": latest["close"]}
+        for cat, label, detail in flags
+    ]
+
+
+all_signal_rows = []
+for t in all_tickers:
+    res = _compute_watchlist_signals(df[df["ticker"] == t])
+    if res:
+        for row in res:
+            row["ticker"] = t
+            all_signal_rows.append(row)
+
+if not all_signal_rows:
+    st.info("No notable signals across your watchlist right now.")
+else:
+    signals_df = pd.DataFrame(all_signal_rows)
+    tab_cross, tab_rsi, tab_range, tab_vol = st.tabs(
+        ["Crossover watch", "RSI extremes", "52-week range", "Volume spikes"]
+    )
+    display_cols = ["ticker", "signal", "detail", "date", "close"]
+    with tab_cross:
+        rows = signals_df[signals_df["category"] == "cross"]
+        if rows.empty:
+            st.info("No crossover activity right now.")
+        else:
+            st.dataframe(rows[display_cols], use_container_width=True, hide_index=True)
+    with tab_rsi:
+        rows = signals_df[signals_df["category"] == "rsi"]
+        if rows.empty:
+            st.info("Nothing at an RSI extreme right now.")
+        else:
+            st.dataframe(rows[display_cols], use_container_width=True, hide_index=True)
+    with tab_range:
+        rows = signals_df[signals_df["category"] == "range"]
+        if rows.empty:
+            st.info("Nothing near its 52-week high/low right now.")
+        else:
+            st.dataframe(rows[display_cols], use_container_width=True, hide_index=True)
+    with tab_vol:
+        rows = signals_df[signals_df["category"] == "volume"]
+        if rows.empty:
+            st.info("No volume spikes right now.")
+        else:
+            st.dataframe(rows[display_cols], use_container_width=True, hide_index=True)
 
 # ---- Latest snapshot table --------------------------------------------------
 
