@@ -17,9 +17,13 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
-from scraper_lib import fetch, parse_page, parse_financials, parse_dividend_announcements  # noqa: E402
+from scraper_lib import (  # noqa: E402
+    fetch, parse_page, parse_financials, parse_dividend_announcements,
+    fetch_open, parse_open_page,
+)
 
 TICKER_IDS_FILE = os.path.join(os.path.dirname(__file__), "ticker_ids.json")
+TICKER_IDS_OPEN_FILE = os.path.join(os.path.dirname(__file__), "ticker_ids_open.json")
 MASTER_CSV = os.path.join(os.path.dirname(__file__), "..", "data", "mse_daily_prices.csv")
 FINANCIALS_CSV = os.path.join(os.path.dirname(__file__), "..", "data", "mse_financials.csv")
 DIVIDENDS_CSV = os.path.join(os.path.dirname(__file__), "..", "data", "mse_dividends.csv")
@@ -40,6 +44,15 @@ DIVIDENDS_FIELDNAMES = ["ticker", "company_name", "date", "headline"]
 def load_ticker_ids():
     with open(TICKER_IDS_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def load_ticker_ids_open():
+    """open.mse.mn IDs are optional — if the file doesn't exist yet, every
+    ticker just falls back to members.mse.mn's (laggier) price data."""
+    if os.path.exists(TICKER_IDS_OPEN_FILE):
+        with open(TICKER_IDS_OPEN_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
 
 
 def load_master():
@@ -104,6 +117,7 @@ def save_dividends(rows):
 
 def main():
     ticker_ids = load_ticker_ids()
+    ticker_ids_open = load_ticker_ids_open()
     master = load_master()
     financials = load_financials()
     dividends = load_dividends()
@@ -114,6 +128,7 @@ def main():
     failures = []
     added_per_ticker = {}
     financials_added_per_ticker = {}
+    price_source_used = {}
 
     for ticker, cid in sorted(ticker_ids.items()):
         html = fetch(cid)
@@ -126,15 +141,32 @@ def main():
             failures.append(ticker)
             continue
 
-        parsed_ticker, name, rows = parsed
+        parsed_ticker, name, members_rows = parsed
         if parsed_ticker != ticker:
             # id->ticker drifted (site restructured); flag it, still use
             # the ticker we expected so downstream data stays consistent
             print(f"NOTE: id {cid} now reports ticker '{parsed_ticker}', "
                   f"expected '{ticker}'. Using expected ticker.")
 
+        # --- Price data: prefer open.mse.mn (current, non-lagging).
+        # Fall back to members.mse.mn's price table if this ticker has no
+        # open.mse.mn id yet, or that fetch/parse fails for any reason. ---
+        price_rows = members_rows
+        source = "members.mse.mn"
+        open_cid = ticker_ids_open.get(ticker)
+        if open_cid is not None:
+            open_html = fetch_open(open_cid)
+            if open_html is not None:
+                open_parsed = parse_open_page(open_html)
+                if open_parsed is not None:
+                    open_ticker, open_rows = open_parsed
+                    if open_ticker == ticker and open_rows:
+                        price_rows = open_rows
+                        source = "open.mse.mn"
+        price_source_used[ticker] = source
+
         added = 0
-        for row in rows:
+        for row in price_rows:
             key = (ticker, row["date"])
             if key not in master:
                 added += 1
@@ -151,7 +183,7 @@ def main():
             }
         added_per_ticker[ticker] = added
 
-        # Financials come from the SAME page — no extra network request.
+        # Financials come from the SAME members.mse.mn page — no extra request.
         fin_rows = parse_financials(html)
         fin_added = 0
         for fr in fin_rows:
@@ -179,7 +211,7 @@ def main():
             }
         financials_added_per_ticker[ticker] = fin_added
 
-        # Dividend announcement dates — also from the same page, no extra request.
+        # Dividend announcement dates — also from the members.mse.mn page.
         div_rows = parse_dividend_announcements(html)
         for dr in div_rows:
             key = (ticker, dr["date"])
@@ -196,7 +228,8 @@ def main():
 
     print(f"Master rows before: {before_count}, after: {len(master)}")
     for ticker, added in added_per_ticker.items():
-        print(f"  {ticker}: +{added} new rows")
+        src = price_source_used.get(ticker, "?")
+        print(f"  {ticker}: +{added} new rows (price source: {src})")
 
     print(f"Financials rows before: {financials_before_count}, "
           f"after: {len(financials)}")

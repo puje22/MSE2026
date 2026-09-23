@@ -11,14 +11,17 @@ import time
 import requests
 
 BASE_URL = "https://members.mse.mn/en/company/{id}"
+BASE_URL_OPEN = "https://open.mse.mn/securities/{id}/tab/tradeinfo"
 TIMEOUT = 20
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; research-scraper/1.0)"
 }
 
-# NOTE: internal company IDs on members.mse.mn are DIFFERENT from the old
-# old.mse.mn IDs (e.g. TTL was 458 on old.mse.mn, but is 510 here). Any
-# previously-built ticker_ids.json must be regenerated against this domain.
+# NOTE: internal company IDs differ between sources. members.mse.mn IDs are
+# NOT the same as old.mse.mn IDs (e.g. TTL was 458 on old.mse.mn, 510 on
+# members.mse.mn). open.mse.mn appears to reuse the OLD old.mse.mn ID scheme
+# (TTL is 458 there too) but don't assume this holds for every ticker —
+# always verify with find_ticker_ids_open.py rather than reusing IDs blindly.
 
 SECTION_MARKER = "Trading history of Block Trade"
 
@@ -35,13 +38,30 @@ ROW_RE = re.compile(
     r"(\d{4}-\d{2}-\d{2})"           # date
 )
 
+# open.mse.mn's ISIN reliably embeds the ticker: "MN00TTL04580" -> "TTL"
+ISIN_TICKER_RE = re.compile(r"ISIN\s+MN00([A-Z]+)\d+")
+
+# open.mse.mn row format is DIFFERENT from members.mse.mn's:
+# # Date Open Close Low-High(as "low - high") Volume Value Transactions
+# e.g. "1 2026-09-22 59,900.00 60,000.00 59,650.00 - 60,000.00 397 23,785,300.00 30"
+OPEN_ROW_RE = re.compile(
+    r"(\d+)\s+"                          # row number
+    r"(\d{4}-\d{2}-\d{2})\s+"            # date
+    r"([\d,]+\.\d{2})\s+"                # open
+    r"([\d,]+\.\d{2})\s+"                # close
+    r"([\d,]+\.\d{2})\s*-\s*"            # low (first half of range)
+    r"([\d,]+\.\d{2})\s+"                # high (second half of range)
+    r"([\d,]+)\s+"                       # volume
+    r"([\d,]+\.\d{2})\s+"                # value
+    r"(\d+)"                             # transaction count
+)
+
 
 def num(s):
     return float(s.replace(",", ""))
 
 
-def fetch(company_id, delay=0.3, retries=3, retry_backoff=2.0):
-    url = BASE_URL.format(id=company_id)
+def fetch_url(url, delay=0.3, retries=3, retry_backoff=2.0):
     last_exc = None
     for attempt in range(retries):
         try:
@@ -55,6 +75,51 @@ def fetch(company_id, delay=0.3, retries=3, retry_backoff=2.0):
                 time.sleep(retry_backoff * (attempt + 1))  # 2s, 4s, ...
     # All retries exhausted
     return None
+
+
+def fetch(company_id, delay=0.3, retries=3, retry_backoff=2.0):
+    """Fetch a members.mse.mn company page (used for company name, financials, dividends)."""
+    return fetch_url(BASE_URL.format(id=company_id), delay, retries, retry_backoff)
+
+
+def fetch_open(company_id, delay=0.3, retries=3, retry_backoff=2.0):
+    """Fetch an open.mse.mn tradeinfo page (used for current, non-lagging price history)."""
+    return fetch_url(BASE_URL_OPEN.format(id=company_id), delay, retries, retry_backoff)
+
+
+def parse_open_page(html):
+    """
+    Parse an open.mse.mn /securities/{id}/tab/tradeinfo page.
+    Returns (ticker, rows) or None if unparseable. rows is a list of
+    {date, open, high, low, close, volume, value, transactions} dicts,
+    newest first (matching the page's own order).
+    """
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, "lxml")
+    text = soup.get_text(" ", strip=True)
+
+    m = ISIN_TICKER_RE.search(text)
+    if not m:
+        return None
+    ticker = m.group(1)
+
+    rows = []
+    for rm in OPEN_ROW_RE.finditer(text):
+        _, date, open_, close, low, high, vol, val, txns = rm.groups()
+        rows.append({
+            "date": date,
+            "open": num(open_),
+            "high": num(high),
+            "low": num(low),
+            "close": num(close),
+            "volume": num(vol),
+            "value": num(val),
+            "transactions": int(txns),
+        })
+    if not rows:
+        return None
+    return ticker, rows
 
 
 FINANCIALS_MARKER = "Summary of Financials"
