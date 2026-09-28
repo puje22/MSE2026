@@ -103,90 +103,126 @@ def parse_todays_trade_number(value):
 
 
 def parse_todays_trade(raw):
-    """
-    Parse MSE's Next.js RSC Today's Trade response.
-
-    Important: the response is NOT one normal JSON document.  It contains
-    several RSC chunks.  The date/time metadata can look like:
-
-        1:{date: "2026-09-25", time: "18:59:06"}
-
-    while the trading data is a separate JSON array chunk.  Therefore we
-    search the whole response for the date/time and independently locate
-    the JSON array containing companySymbol records.
-    """
+    """Parse MSE's Next.js RSC Today's Trade response."""
     if not raw:
         raise ValueError("Empty MSE Today's Trade response")
 
-    # ------------------------------------------------------------
-    # Trading session date/time.
-    # ------------------------------------------------------------
+    # MSE has returned this metadata in several RSC representations, e.g.
+    #   {date: "2026-09-28", time: "18:59:06"}
+    #   {"date":"2026-09-28","time":"18:59:06"}
+    #   {\"date\":\"2026-09-28\",\"time\":\"18:59:06\"}
+    # Normalize escaped quotes first.
+    normalized = raw.replace(r'\"', '"')
+
     date_match = re.search(
-        r'"?date"?\s*:\s*"(\d{4}-\d{2}-\d{2})"',
-        raw,
+        r'''(?i)(?:["']?date["']?)\s*:\s*["'](\d{4}-\d{2}-\d{2})''',
+        normalized,
     )
     time_match = re.search(
-        r'"?time"?\s*:\s*"(\d{2}:\d{2}:\d{2})"',
-        raw,
+        r'''(?i)(?:["']?time["']?)\s*:\s*["'](\d{2}:\d{2}:\d{2})''',
+        normalized,
     )
 
-    if not date_match or not time_match:
-        # Keep this diagnostic useful without dumping the entire response.
-        raise ValueError(
-            "Could not find trading date/time in MSE Today's Trade response"
+    # Also accept an ISO datetime.
+    if not date_match:
+        date_match = re.search(
+            r'''(?i)(?:["']?date["']?)\s*:\s*["'](\d{4}-\d{2}-\d{2})T''',
+            normalized,
         )
 
-    trading_date = date_match.group(1)
-    trading_time = time_match.group(1)
+    # Last-resort timestamp search.
+    if not date_match or not time_match:
+        iso_match = re.search(
+            r'\b(20\d{2}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})\b',
+            normalized,
+        )
+        if iso_match:
+            trading_date = iso_match.group(1)
+            trading_time = iso_match.group(2)
+        else:
+            trading_date = date_match.group(1) if date_match else None
+            trading_time = time_match.group(1) if time_match else None
+    else:
+        trading_date = date_match.group(1)
+        trading_time = time_match.group(1)
+
+    if not trading_date or not trading_time:
+        diagnostics = []
+        for match in re.finditer(r'(?i)(date|time)', normalized):
+            pos = match.start()
+            diagnostics.append(normalized[max(0, pos - 100):pos + 220])
+            if len(diagnostics) >= 4:
+                break
+        detail = ' | '.join(repr(x) for x in diagnostics)
+        raise ValueError(
+            "Could not find trading date/time in MSE Today's Trade "
+            f"response. Snippets: {detail or '[no date/time text found]'}"
+        )
 
     # ------------------------------------------------------------
-    # Locate the trading array.
+    # Find the actual trading array.
     # ------------------------------------------------------------
-    # We use JSONDecoder.raw_decode instead of a greedy regex.  This lets
-    # us parse a very large array safely even when it contains many records.
     decoder = json.JSONDecoder()
     trading_data = None
 
-    # Every RSC chunk starts with something like "1:" or "2:".
-    # Find chunk positions and try to decode a JSON value immediately
-    # following the colon.  We only accept an array containing dictionaries
-    # with companySymbol, which uniquely identifies the Today's Trade table.
-    for match in re.finditer(r"(?m)^\d+:", raw):
+    # Standard RSC chunks begin with 0:, 1:, 2:, etc.
+    for match in re.finditer(r'(?m)^\d+:', normalized):
         start = match.end()
-
-        # RSC may have whitespace before the JSON value.
-        while start < len(raw) and raw[start].isspace():
+        while start < len(normalized) and normalized[start].isspace():
             start += 1
 
-        if start >= len(raw) or raw[start] != "[":
+        if start >= len(normalized) or normalized[start] != '[':
             continue
 
         try:
-            candidate, _ = decoder.raw_decode(raw[start:])
+            candidate, _ = decoder.raw_decode(normalized[start:])
         except json.JSONDecodeError:
             continue
 
-        if not isinstance(candidate, list) or not candidate:
-            continue
-
-        if any(
-            isinstance(item, dict) and "companySymbol" in item
-            for item in candidate
+        if (
+            isinstance(candidate, list)
+            and candidate
+            and any(
+                isinstance(item, dict)
+                and 'companySymbol' in item
+                for item in candidate
+            )
         ):
             trading_data = candidate
             break
 
-    # Fallback: some RSC formatting may not put every chunk on its own line.
+    # More tolerant fallback: locate companySymbol and walk backwards to
+    # a JSON array beginning with '['.
     if trading_data is None:
-        for match in re.finditer(r"\[\s*\{\s*\"companySymbol\"", raw):
-            try:
-                candidate, _ = decoder.raw_decode(raw[match.start():])
-            except json.JSONDecodeError:
-                continue
-
-            if isinstance(candidate, list) and candidate:
-                trading_data = candidate
+        marker = '"companySymbol"'
+        pos = 0
+        while True:
+            pos = normalized.find(marker, pos)
+            if pos < 0:
                 break
+
+            array_start = normalized.rfind('[', 0, pos + 1)
+            if array_start >= 0:
+                try:
+                    candidate, _ = decoder.raw_decode(
+                        normalized[array_start:]
+                    )
+                except json.JSONDecodeError:
+                    candidate = None
+
+                if (
+                    isinstance(candidate, list)
+                    and candidate
+                    and any(
+                        isinstance(item, dict)
+                        and 'companySymbol' in item
+                        for item in candidate
+                    )
+                ):
+                    trading_data = candidate
+                    break
+
+            pos += len(marker)
 
     if trading_data is None:
         raise ValueError(
@@ -199,140 +235,39 @@ def parse_todays_trade(raw):
         if not isinstance(item, dict):
             continue
 
-        ticker = item.get("companySymbol")
+        ticker = item.get('companySymbol')
         if not ticker:
             continue
 
         rows.append(
             {
-                "ticker": str(ticker).strip(),
-                "code": item.get("code"),
-                "open": parse_todays_trade_number(
-                    item.get("OpeningPrice")
-                ),
-                "high": parse_todays_trade_number(
-                    item.get("HighPrice")
-                ),
-                "low": parse_todays_trade_number(
-                    item.get("LowPrice")
-                ),
-                # IMPORTANT: ClosingPrice is the daily close.
-                "close": parse_todays_trade_number(
-                    item.get("ClosingPrice")
-                ),
-                "last": parse_todays_trade_number(
-                    item.get("LastTradedPrice")
-                ),
-                "previous_close": parse_todays_trade_number(
-                    item.get("PreviousClose")
-                ),
-                "change": item.get("Changes"),
-                "change_pct": item.get("changePercentage"),
-                "volume": parse_todays_trade_number(
-                    item.get("Volume")
-                ),
-                "turnover": parse_todays_trade_number(
-                    item.get("Turnover")
-                ),
-                "buy_order_qty": parse_todays_trade_number(
-                    item.get("BuyOrderQty")
-                ),
-                "highest_bid": parse_todays_trade_number(
-                    item.get("HighestBidPrice")
-                ),
-                "sell_order_qty": parse_todays_trade_number(
-                    item.get("SellOrderQty")
-                ),
-                "lowest_offer": parse_todays_trade_number(
-                    item.get("LowestOfferPrice")
-                ),
+                'ticker': str(ticker).strip(),
+                'code': item.get('code'),
+                'open': parse_todays_trade_number(item.get('OpeningPrice')),
+                'high': parse_todays_trade_number(item.get('HighPrice')),
+                'low': parse_todays_trade_number(item.get('LowPrice')),
+                'close': parse_todays_trade_number(item.get('ClosingPrice')),
+                'last': parse_todays_trade_number(item.get('LastTradedPrice')),
+                'previous_close': parse_todays_trade_number(item.get('PreviousClose')),
+                'change': item.get('Changes'),
+                'change_pct': item.get('changePercentage'),
+                'volume': parse_todays_trade_number(item.get('Volume')),
+                'turnover': parse_todays_trade_number(item.get('Turnover')),
+                'buy_order_qty': parse_todays_trade_number(item.get('BuyOrderQty')),
+                'highest_bid': parse_todays_trade_number(item.get('HighestBidPrice')),
+                'sell_order_qty': parse_todays_trade_number(item.get('SellOrderQty')),
+                'lowest_offer': parse_todays_trade_number(item.get('LowestOfferPrice')),
             }
         )
 
     if not rows:
-        raise ValueError(
-            "MSE Today's Trade response contained no company rows"
-        )
+        raise ValueError("Today's Trade response contained no securities")
 
     return {
-        "date": trading_date,
-        "time": trading_time,
-        "rows": rows,
+        'date': trading_date,
+        'time': trading_time,
+        'rows': rows,
     }
-
-
-TICKER_IDS_FILE = os.path.join(
-    os.path.dirname(__file__),
-    "ticker_ids.json",
-)
-
-TICKER_IDS_OPEN_FILE = os.path.join(
-    os.path.dirname(__file__),
-    "ticker_ids_open.json",
-)
-
-MASTER_CSV = os.path.join(
-    os.path.dirname(__file__),
-    "..",
-    "data",
-    "mse_daily_prices.csv",
-)
-
-FINANCIALS_CSV = os.path.join(
-    os.path.dirname(__file__),
-    "..",
-    "data",
-    "mse_financials.csv",
-)
-
-DIVIDENDS_CSV = os.path.join(
-    os.path.dirname(__file__),
-    "..",
-    "data",
-    "mse_dividends.csv",
-)
-
-
-FIELDNAMES = [
-    "ticker",
-    "company_name",
-    "date",
-    "open",
-    "high",
-    "low",
-    "close",
-    "volume",
-    "value",
-]
-
-
-FINANCIALS_FIELDNAMES = [
-    "ticker",
-    "company_name",
-    "year",
-    "total_assets",
-    "total_liabilities",
-    "total_equity",
-    "issued_shares",
-    "sales_revenue",
-    "cost_of_sales",
-    "gross_profit",
-    "net_income",
-    "book_value_per_share",
-    "roa",
-    "roe",
-    "rota",
-    "eps",
-    "pe_ratio",
-]
-
-
-DIVIDENDS_FIELDNAMES = [
-    "ticker",
-    "company_name",
-    "date",
-    "headline",
-]
 
 
 def load_ticker_ids():
