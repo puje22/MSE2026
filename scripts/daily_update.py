@@ -18,7 +18,9 @@ Safe to run manually too:
 import csv
 import json
 import os
+import re
 import sys
+import requests
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -29,9 +31,234 @@ from scraper_lib import (  # noqa: E402
     parse_dividend_announcements,
     fetch_open,
     parse_open_page,
-    fetch_todays_trade,
-    parse_todays_trade,
 )
+
+
+# ================================================================
+# MSE TODAY'S TRADE
+# ================================================================
+# This endpoint is a Next.js Server Action.  Its response is RSC
+# text, not ordinary JSON.  The exact RSC chunk numbering can vary,
+# so do not assume that chunk "1:" is always the trading array.
+
+TODAYS_TRADE_URL = "https://mse.mn/todays-trade"
+TODAYS_TRADE_NEXT_ACTION = "6d867ebd99fb6edef2f9537b22668cd0c00a71c2"
+TODAYS_TRADE_ROUTER_STATE = (
+    '["",{"children":["(navbar)",{"children":["(trade)",'
+    '{"children":["todays-trade",{"children":["__PAGE__",{},'
+    '"/todays-trade","refresh"]}]}]}]},null,null,true]'
+)
+
+TODAYS_TRADE_HEADERS = {
+    "Accept": "text/x-component",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Content-Type": "text/plain;charset=UTF-8",
+    "Next-Action": TODAYS_TRADE_NEXT_ACTION,
+    "Next-Router-State-Tree": TODAYS_TRADE_ROUTER_STATE,
+    "Origin": "https://mse.mn",
+    "Referer": "https://mse.mn/todays-trade",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/151.0.0.0 Safari/537.36 OPR/135.0.0.0"
+    ),
+}
+
+TODAYS_TRADE_PAYLOAD = json.dumps(
+    [
+        {
+            "url": "tradingStatus1",
+            "parameter": "?lang=mn",
+            "config": {"hasToken": False},
+        }
+    ],
+    separators=(",", ":"),
+)
+
+
+def fetch_todays_trade():
+    """Fetch the raw RSC response from MSE Today's Trade."""
+    response = requests.post(
+        TODAYS_TRADE_URL,
+        headers=TODAYS_TRADE_HEADERS,
+        data=TODAYS_TRADE_PAYLOAD,
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.text
+
+
+def parse_todays_trade_number(value):
+    """Convert MSE numeric strings such as '12,345.67' to float."""
+    if value is None or value == "":
+        return None
+
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    try:
+        return float(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_todays_trade(raw):
+    """
+    Parse MSE's Next.js RSC Today's Trade response.
+
+    Important: the response is NOT one normal JSON document.  It contains
+    several RSC chunks.  The date/time metadata can look like:
+
+        1:{date: "2026-09-25", time: "18:59:06"}
+
+    while the trading data is a separate JSON array chunk.  Therefore we
+    search the whole response for the date/time and independently locate
+    the JSON array containing companySymbol records.
+    """
+    if not raw:
+        raise ValueError("Empty MSE Today's Trade response")
+
+    # ------------------------------------------------------------
+    # Trading session date/time.
+    # ------------------------------------------------------------
+    date_match = re.search(
+        r'"?date"?\s*:\s*"(\d{4}-\d{2}-\d{2})"',
+        raw,
+    )
+    time_match = re.search(
+        r'"?time"?\s*:\s*"(\d{2}:\d{2}:\d{2})"',
+        raw,
+    )
+
+    if not date_match or not time_match:
+        # Keep this diagnostic useful without dumping the entire response.
+        raise ValueError(
+            "Could not find trading date/time in MSE Today's Trade response"
+        )
+
+    trading_date = date_match.group(1)
+    trading_time = time_match.group(1)
+
+    # ------------------------------------------------------------
+    # Locate the trading array.
+    # ------------------------------------------------------------
+    # We use JSONDecoder.raw_decode instead of a greedy regex.  This lets
+    # us parse a very large array safely even when it contains many records.
+    decoder = json.JSONDecoder()
+    trading_data = None
+
+    # Every RSC chunk starts with something like "1:" or "2:".
+    # Find chunk positions and try to decode a JSON value immediately
+    # following the colon.  We only accept an array containing dictionaries
+    # with companySymbol, which uniquely identifies the Today's Trade table.
+    for match in re.finditer(r"(?m)^\d+:", raw):
+        start = match.end()
+
+        # RSC may have whitespace before the JSON value.
+        while start < len(raw) and raw[start].isspace():
+            start += 1
+
+        if start >= len(raw) or raw[start] != "[":
+            continue
+
+        try:
+            candidate, _ = decoder.raw_decode(raw[start:])
+        except json.JSONDecodeError:
+            continue
+
+        if not isinstance(candidate, list) or not candidate:
+            continue
+
+        if any(
+            isinstance(item, dict) and "companySymbol" in item
+            for item in candidate
+        ):
+            trading_data = candidate
+            break
+
+    # Fallback: some RSC formatting may not put every chunk on its own line.
+    if trading_data is None:
+        for match in re.finditer(r"\[\s*\{\s*\"companySymbol\"", raw):
+            try:
+                candidate, _ = decoder.raw_decode(raw[match.start():])
+            except json.JSONDecodeError:
+                continue
+
+            if isinstance(candidate, list) and candidate:
+                trading_data = candidate
+                break
+
+    if trading_data is None:
+        raise ValueError(
+            "Could not find trading data array in MSE Today's Trade response"
+        )
+
+    rows = []
+
+    for item in trading_data:
+        if not isinstance(item, dict):
+            continue
+
+        ticker = item.get("companySymbol")
+        if not ticker:
+            continue
+
+        rows.append(
+            {
+                "ticker": str(ticker).strip(),
+                "code": item.get("code"),
+                "open": parse_todays_trade_number(
+                    item.get("OpeningPrice")
+                ),
+                "high": parse_todays_trade_number(
+                    item.get("HighPrice")
+                ),
+                "low": parse_todays_trade_number(
+                    item.get("LowPrice")
+                ),
+                # IMPORTANT: ClosingPrice is the daily close.
+                "close": parse_todays_trade_number(
+                    item.get("ClosingPrice")
+                ),
+                "last": parse_todays_trade_number(
+                    item.get("LastTradedPrice")
+                ),
+                "previous_close": parse_todays_trade_number(
+                    item.get("PreviousClose")
+                ),
+                "change": item.get("Changes"),
+                "change_pct": item.get("changePercentage"),
+                "volume": parse_todays_trade_number(
+                    item.get("Volume")
+                ),
+                "turnover": parse_todays_trade_number(
+                    item.get("Turnover")
+                ),
+                "buy_order_qty": parse_todays_trade_number(
+                    item.get("BuyOrderQty")
+                ),
+                "highest_bid": parse_todays_trade_number(
+                    item.get("HighestBidPrice")
+                ),
+                "sell_order_qty": parse_todays_trade_number(
+                    item.get("SellOrderQty")
+                ),
+                "lowest_offer": parse_todays_trade_number(
+                    item.get("LowestOfferPrice")
+                ),
+            }
+        )
+
+    if not rows:
+        raise ValueError(
+            "MSE Today's Trade response contained no company rows"
+        )
+
+    return {
+        "date": trading_date,
+        "time": trading_time,
+        "rows": rows,
+    }
 
 
 TICKER_IDS_FILE = os.path.join(
