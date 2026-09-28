@@ -18,6 +18,17 @@ import requests
 
 BASE_URL = "https://members.mse.mn/en/company/{id}"
 BASE_URL_OPEN = "https://open.mse.mn/securities/{id}/tab/tradeinfo"
+MSE_TODAYS_TRADE_URL = "https://mse.mn/todays-trade"
+
+# Next.js Server Action used by mse.mn/todays-trade.
+# This can change when MSE deploys a new site build.
+MSE_TODAYS_TRADE_NEXT_ACTION = "6d867ebd99fb6edef2f9537b22668cd0c00a71c2"
+
+MSE_TODAYS_TRADE_ROUTER_STATE = (
+    '["",{"children":["(navbar)",{"children":["(trade)",'
+    '{"children":["todays-trade",{"children":["__PAGE__",{},'
+    '"/todays-trade","refresh"]}]}]}]},null,null,true]'
+)
 
 TIMEOUT = 20
 
@@ -184,6 +195,187 @@ def fetch_open(company_id, delay=0.3, retries=3, retry_backoff=2.0):
         retries,
         retry_backoff,
     )
+
+
+def fetch_todays_trade(timeout=TIMEOUT, retries=3, retry_backoff=2.0):
+    """
+    Fetch the MSE Today's Trade server-action response.
+
+    This is used as a fallback when open.mse.mn and/or members.mse.mn
+    have not yet published the newest trading session.
+
+    Returns the raw text/x-component response, or None after retries fail.
+    """
+    headers = {
+        "Accept": "text/x-component",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Content-Type": "text/plain;charset=UTF-8",
+        "Next-Action": MSE_TODAYS_TRADE_NEXT_ACTION,
+        "Next-Router-State-Tree": MSE_TODAYS_TRADE_ROUTER_STATE,
+        "Origin": "https://mse.mn",
+        "Referer": MSE_TODAYS_TRADE_URL,
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/151.0.0.0 Safari/537.36 OPR/135.0.0.0"
+        ),
+    }
+
+    payload = json.dumps(
+        [
+            {
+                "url": "tradingStatus1",
+                "parameter": "?lang=mn",
+                "config": {"hasToken": False},
+            }
+        ],
+        separators=(",", ":"),
+    )
+
+    last_exc = None
+
+    for attempt in range(retries):
+        try:
+            response = requests.post(
+                MSE_TODAYS_TRADE_URL,
+                headers=headers,
+                data=payload,
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            return response.text
+
+        except requests.RequestException as exc:
+            last_exc = exc
+
+            if attempt < retries - 1:
+                time.sleep(retry_backoff * (attempt + 1))
+
+    return None
+
+
+# ============================================================
+# MSE.MN TODAY'S TRADE PARSER
+# ============================================================
+
+
+def parse_todays_trade(text):
+    """
+    Parse the MSE Today's Trade Next.js response.
+
+    Returns:
+        {
+            "date": "YYYY-MM-DD",
+            "time": "HH:MM:SS",
+            "rows": [
+                {
+                    "date": str,
+                    "ticker": str,
+                    "code": int,
+                    "open": float | None,
+                    "high": float | None,
+                    "low": float | None,
+                    "close": float | None,
+                    "volume": float | None,
+                    "value": float | None,
+                    "transactions": int | None,
+                    ...
+                },
+                ...
+            ]
+        }
+
+    The trading date/time comes from MSE's response itself. We do not
+    use the computer's calendar date, because the latest trading session
+    may be from a previous calendar day (for example, after a weekend
+    or holiday).
+    """
+    if not text:
+        raise ValueError("Empty MSE Today's Trade response.")
+
+    # The response contains metadata such as:
+    #   1:{date: "2026-09-25", time: "18:59:06"}
+    # Depending on the RSC response encoding, the metadata may be JSON-like
+    # or use unquoted property names, so match the fields directly.
+    meta_match = re.search(
+        r'date:\s*["\'](\d{4}-\d{2}-\d{2})["\'].*?' 
+        r'time:\s*["\'](\d{2}:\d{2}:\d{2})["\']',
+        text,
+        flags=re.DOTALL,
+    )
+
+    if not meta_match:
+        raise ValueError(
+            "Could not find trading date/time in MSE Today's Trade response."
+        )
+
+    trading_date = meta_match.group(1)
+    trading_time = meta_match.group(2)
+
+    # Find the RSC line containing the trading-data array. Do not assume
+    # its numeric chunk id is always 1 because Next.js RSC chunk numbering
+    # can change.
+    array_match = re.search(
+        r'(?m)^\d+:(\[.*"companySymbol".*\])$',
+        text,
+    )
+
+    if not array_match:
+        raise ValueError(
+            "Could not find trading-data array in MSE Today's Trade response."
+        )
+
+    try:
+        data = json.loads(array_match.group(1))
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "Could not decode MSE Today's Trade data array."
+        ) from exc
+
+    if not isinstance(data, list):
+        raise ValueError("MSE Today's Trade data is not a list.")
+
+    rows = []
+
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+
+        ticker = row.get("companySymbol")
+        code = row.get("code")
+
+        if not ticker or code is None:
+            continue
+
+        rows.append(
+            {
+                "date": trading_date,
+                "ticker": str(ticker).strip(),
+                "code": code,
+                "open": _optional_num(row.get("OpeningPrice")),
+                "high": _optional_num(row.get("HighPrice")),
+                "low": _optional_num(row.get("LowPrice")),
+                # IMPORTANT: ClosingPrice is the daily closing price.
+                "close": _optional_num(row.get("ClosingPrice")),
+                "volume": _optional_num(row.get("Volume")),
+                "value": _optional_num(row.get("Turnover")),
+                "transactions": _optional_num(row.get("Trades")),
+                "last": _optional_num(row.get("LastTradedPrice")),
+                "previous_close": _optional_num(row.get("PreviousClose")),
+                "change": row.get("Changes"),
+                "change_pct": row.get("changePercentage"),
+                "buy_order_qty": _optional_num(row.get("BuyOrderQty")),
+                "highest_bid": _optional_num(row.get("HighestBidPrice")),
+                "sell_order_qty": _optional_num(row.get("SellOrderQty")),
+                "lowest_offer": _optional_num(row.get("LowestOfferPrice")),
+            }
+        )
+
+    return {
+        "date": trading_date,
+        "time": trading_time,
+        "rows": rows,
+    }
 
 
 # ============================================================
