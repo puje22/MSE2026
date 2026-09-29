@@ -1,7 +1,11 @@
 import json
+from pathlib import Path
+
 from scraper_lib import fetch, parse_page
 
-ids = json.load(open("ticker_ids.json"))
+SCRIPT_DIR = Path(__file__).resolve().parent
+with (SCRIPT_DIR / "ticker_ids.json").open("r", encoding="utf-8") as f:
+    ids = json.load(f)
 
 for t in ["TUM", "XAC", "XOC"]:
     cid = ids.get(t)

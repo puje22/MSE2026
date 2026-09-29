@@ -8,11 +8,17 @@ Usage (from the scripts/ folder):
 
 import sys
 import json
+from pathlib import Path
+
 from bs4 import BeautifulSoup
 from scraper_lib import fetch
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+with (SCRIPT_DIR / "ticker_ids.json").open("r", encoding="utf-8") as f:
+    ids = json.load(f)
+
 ticker = sys.argv[1] if len(sys.argv) > 1 else "TTL"
-ids = json.load(open("ticker_ids.json"))
 cid = ids[ticker]
 
 html = fetch(cid)

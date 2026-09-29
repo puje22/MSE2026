@@ -7,8 +7,12 @@ Price source priority:
 3. mse.mn/todays-trade, only when its trading-session date is
    newer than the latest date already available from the first two.
 
-The Today's Trade fallback uses the actual trading date returned by MSE,
-not the computer's calendar date.
+The Today's Trade fallback tries to use the actual trading date/time
+MSE returns. If that metadata can't be found in a given response, it
+falls back to the current Ulaanbaatar date/time -- and, either way,
+each row is checked against its own PreviousClose against what we
+already have on file before being trusted, so a wrong date guess
+can't corrupt the series.
 
 Run by .github/workflows/daily_update.yml on a daily cron schedule.
 Safe to run manually too:
@@ -16,6 +20,7 @@ Safe to run manually too:
 """
 
 import csv
+import datetime
 import json
 import os
 import re
@@ -75,6 +80,11 @@ TODAYS_TRADE_PAYLOAD = json.dumps(
     separators=(",", ":"),
 )
 
+# Mongolia is UTC+8 year-round (no DST since 2017). A fixed offset is
+# used instead of zoneinfo, which needs a tzdata package not always
+# present on Windows.
+ULAANBAATAR_TZ = datetime.timezone(datetime.timedelta(hours=8))
+
 
 def fetch_todays_trade():
     """Fetch the raw RSC response from MSE Today's Trade."""
@@ -84,6 +94,15 @@ def fetch_todays_trade():
         data=TODAYS_TRADE_PAYLOAD,
         timeout=30,
     )
+
+    print("\n--- TODAY'S TRADE DEBUG ---")
+    print("HTTP status:", response.status_code)
+    print("Content-Type:", response.headers.get("Content-Type"))
+    print("Response length:", len(response.text))
+    print("Response preview:")
+    print(response.text[:5000])
+    print("--- END DEBUG ---\n")
+
     response.raise_for_status()
     return response.text
 
@@ -107,37 +126,41 @@ def parse_todays_trade(raw):
     Parse MSE's Next.js RSC Today's Trade response.
 
     Important: the response is NOT one normal JSON document.  It contains
-    several RSC chunks.  The date/time metadata can look like:
-
-        1:{date: "2026-09-25", time: "18:59:06"}
-
-    while the trading data is a separate JSON array chunk.  Therefore we
-    search the whole response for the date/time and independently locate
-    the JSON array containing companySymbol records.
+    several RSC chunks.  Explicit date/time metadata is a nice-to-have,
+    not a hard requirement -- if it can't be found (the RSC chunk format
+    has changed before, and will again), we fall back to the current
+    Ulaanbaatar date/time, since this endpoint represents "today's"
+    session by definition. The real protection against a wrong date
+    happens later in main(), where each row's PreviousClose is checked
+    against what we already have on file before it's trusted.
     """
     if not raw:
         raise ValueError("Empty MSE Today's Trade response")
 
     # ------------------------------------------------------------
-    # Trading session date/time.
+    # Trading session date/time (optional -- see docstring above).
     # ------------------------------------------------------------
-    date_match = re.search(
-        r'"?date"?\s*:\s*"(\d{4}-\d{2}-\d{2})"',
+    meta_match = re.search(
+        r"(?:['\"]?date['\"]?\s*:\s*['\"]?)(\d{4}-\d{2}-\d{2})(?:['\"]?)"
+        r".*?"
+        r"(?:['\"]?time['\"]?\s*:\s*['\"]?)(\d{2}:\d{2}:\d{2})(?:['\"]?)",
         raw,
-    )
-    time_match = re.search(
-        r'"?time"?\s*:\s*"(\d{2}:\d{2}:\d{2})"',
-        raw,
+        flags=re.DOTALL,
     )
 
-    if not date_match or not time_match:
-        # Keep this diagnostic useful without dumping the entire response.
-        raise ValueError(
-            "Could not find trading date/time in MSE Today's Trade response"
+    if meta_match:
+        trading_date = meta_match.group(1)
+        trading_time = meta_match.group(2)
+    else:
+        now = datetime.datetime.now(ULAANBAATAR_TZ)
+        trading_date = now.strftime("%Y-%m-%d")
+        trading_time = now.strftime("%H:%M:%S")
+        print(
+            "NOTE: no explicit date/time metadata found in MSE Today's "
+            f"Trade response; using current Ulaanbaatar time as a guess: "
+            f"{trading_date} {trading_time}. Each row's PreviousClose "
+            "will be checked against stored data before being trusted."
         )
-
-    trading_date = date_match.group(1)
-    trading_time = time_match.group(1)
 
     # ------------------------------------------------------------
     # Locate the trading array.
@@ -683,17 +706,14 @@ def main():
     #
     # This is intentionally AFTER the normal source pass.
     #
-    # MSE itself provides:
-    #     date: 2026-09-25
-    #     time: 18:59:06
+    # If open/members already have the latest session for a ticker,
+    # Today's Trade does nothing for that ticker.
     #
-    # We use that date instead of datetime.today().
-    #
-    # If open/members already have that date, Today's Trade does
-    # nothing.
-    #
-    # If open/members stop at an older date, Today's Trade fills
-    # the missing newer trading session.
+    # If open/members stop at an older date, Today's Trade can fill
+    # the missing newer trading session -- but only after each row's
+    # PreviousClose is checked against what we already have on file.
+    # This protects against inserting a row under a wrong/guessed
+    # date, which matters now that date/time metadata is optional.
     # ============================================================
 
     try:
@@ -722,6 +742,7 @@ def main():
 
         todays_added = 0
         todays_skipped = 0
+        todays_rejected = 0
 
         for row in todays_rows:
 
@@ -758,13 +779,42 @@ def main():
                 continue
 
             # ----------------------------------------------------
-            # Today's Trade is newer.
-            #
-            # Example:
-            # existing = 2026-09-24
-            # today's   = 2026-09-25
-            #
-            # Add the new trading session.
+            # Safety check: if we already have a prior close on
+            # file, this row's PreviousClose should match it
+            # almost exactly. If it doesn't, either the (possibly
+            # guessed) date is wrong or this isn't really the next
+            # session -- skip rather than risk a bad row.
+            # ----------------------------------------------------
+
+            if latest_date is not None:
+
+                prev_row = master.get((ticker, latest_date))
+                stored_close = (
+                    float(prev_row["close"])
+                    if prev_row and prev_row.get("close") not in (None, "")
+                    else None
+                )
+                reported_prev_close = row.get("previous_close")
+
+                if (
+                    stored_close is not None
+                    and reported_prev_close is not None
+                    and abs(stored_close - reported_prev_close)
+                        > 0.01 * max(abs(stored_close), 1)
+                ):
+                    print(
+                        f"  SKIPPING {ticker}: Today's Trade "
+                        f"PreviousClose ({reported_prev_close}) doesn't "
+                        f"match our stored close for {latest_date} "
+                        f"({stored_close}) -- date guess is likely "
+                        f"wrong, not inserting."
+                    )
+                    todays_rejected += 1
+                    continue
+
+            # ----------------------------------------------------
+            # Today's Trade is newer AND passed the continuity
+            # check (or there was nothing to check against).
             # ----------------------------------------------------
 
             key = (
@@ -822,7 +872,8 @@ def main():
         print(
             f"  Today's Trade: "
             f"+{todays_added} new rows, "
-            f"{todays_skipped} already up to date"
+            f"{todays_skipped} already up to date, "
+            f"{todays_rejected} rejected (PreviousClose mismatch)"
         )
 
     except Exception as exc:

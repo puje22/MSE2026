@@ -10,12 +10,19 @@ Usage (from scripts/ folder):
 """
 
 import json
+from pathlib import Path
+
 from scraper_lib import fetch_open, parse_open_page
+
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 MISSING = ["AARD", "CUMN", "ERDN", "GLMT", "KHAN", "LEND", "MNDL", "QPAY", "SEND"]
 
-members_ids = json.load(open("ticker_ids.json"))
-open_ids = json.load(open("ticker_ids_open.json")) if __import__("os").path.exists("ticker_ids_open.json") else {}
+with (SCRIPT_DIR / "ticker_ids.json").open("r", encoding="utf-8") as f:
+    members_ids = json.load(f)
+
+open_ids_path = SCRIPT_DIR / "ticker_ids_open.json"
+open_ids = json.loads(open_ids_path.read_text(encoding="utf-8")) if open_ids_path.exists() else {}
 
 found_new = {}
 
@@ -46,7 +53,7 @@ for ticker in MISSING:
 
 if found_new:
     open_ids.update(found_new)
-    with open("ticker_ids_open.json", "w", encoding="utf-8") as f:
+    with open_ids_path.open("w", encoding="utf-8") as f:
         json.dump(open_ids, f, indent=2, sort_keys=True)
     print(f"\nUpdated ticker_ids_open.json with {len(found_new)} new match(es).")
 
