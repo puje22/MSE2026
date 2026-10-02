@@ -334,6 +334,7 @@ FIELDNAMES = [
     "close",
     "volume",
     "value",
+    "transactions",
 ]
 
 
@@ -643,6 +644,9 @@ def main():
                 "close": row["close"],
                 "volume": row["volume"],
                 "value": row["value"],
+                # Only open.mse.mn's JSON provides trade counts; blank
+                # (not fabricated) for members.mse.mn-sourced rows.
+                "transactions": row.get("transactions"),
             }
 
         added_per_ticker[ticker] = added
@@ -917,6 +921,9 @@ def main():
                 # Today's Trade calls this Turnover.
                 # Our master CSV calls the field "value".
                 "value": row["turnover"],
+
+                # mse.mn/todays-trade doesn't expose a trade count either.
+                "transactions": None,
             }
 
             todays_added += 1
