@@ -289,6 +289,213 @@ fig2.update_layout(
 )
 st.plotly_chart(fig2, use_container_width=True)
 
+# ---- Liquidity Analysis ------------------------------------------------------
+
+st.header("Liquidity Analysis")
+st.caption(
+    "Compares how actively the tracked MSE stocks trade. Historical turnover uses "
+    "the existing `value` field (MNT traded), while volume is the number of shares "
+    "traded. Rankings use the latest 60 market sessions in the dataset so tickers "
+    "are compared over the same dates."
+)
+
+
+def _fmt_mnt(value):
+    """Compact MNT formatting for turnover metrics."""
+    if value is None or pd.isna(value):
+        return "n/a"
+    value = float(value)
+    if abs(value) >= 1_000_000_000:
+        return f"₮{value / 1_000_000_000:.2f}B"
+    if abs(value) >= 1_000_000:
+        return f"₮{value / 1_000_000:.1f}M"
+    if abs(value) >= 1_000:
+        return f"₮{value / 1_000:.1f}K"
+    return f"₮{value:,.0f}"
+
+
+def _liquidity_summary(data, sessions=60):
+    """Build comparable liquidity metrics over common market-session dates."""
+    if data.empty:
+        return pd.DataFrame()
+
+    market_dates = sorted(data["date"].dropna().unique())
+    market_dates = market_dates[-sessions:]
+    if not market_dates:
+        return pd.DataFrame()
+
+    rows = []
+    for ticker in sorted(data["ticker"].dropna().unique()):
+        t = data[
+            (data["ticker"] == ticker) & data["date"].isin(market_dates)
+        ][["date", "volume", "value"]].copy()
+
+        # Reindex to the same MSE session dates. A missing ticker/date is treated
+        # as no recorded trading activity for liquidity-frequency calculations.
+        t = t.drop_duplicates("date", keep="last").set_index("date")
+        t = t.reindex(pd.DatetimeIndex(market_dates))
+        volume = pd.to_numeric(t["volume"], errors="coerce").fillna(0)
+        turnover = pd.to_numeric(t["value"], errors="coerce").fillna(0)
+
+        traded = (volume > 0) | (turnover > 0)
+        trading_days_pct = traded.mean() * 100 if len(traded) else None
+
+        avg_turnover_60 = turnover.mean() if len(turnover) else None
+        avg_volume_60 = volume.mean() if len(volume) else None
+        avg_turnover_20 = turnover.tail(20).mean() if len(turnover) else None
+        avg_volume_20 = volume.tail(20).mean() if len(volume) else None
+
+        prior20_turnover = turnover.iloc[-40:-20].mean() if len(turnover) >= 40 else None
+        turnover_trend_pct = (
+            (avg_turnover_20 / prior20_turnover - 1) * 100
+            if prior20_turnover is not None and prior20_turnover > 0
+            else None
+        )
+
+        latest_volume = volume.iloc[-1] if len(volume) else None
+        # Compare the latest session with the preceding 20 sessions, excluding
+        # the latest observation from its own benchmark.
+        prior_vol = volume.iloc[:-1].tail(20)
+        prior_avg_volume = prior_vol.mean() if len(prior_vol) else None
+        relative_volume = (
+            latest_volume / prior_avg_volume
+            if prior_avg_volume is not None and prior_avg_volume > 0
+            else None
+        )
+
+        rows.append({
+            "ticker": ticker,
+            "20D avg turnover": avg_turnover_20,
+            "60D avg turnover": avg_turnover_60,
+            "20D avg volume": avg_volume_20,
+            "60D avg volume": avg_volume_60,
+            "trading days %": trading_days_pct,
+            "zero/no-trade days": int((~traded).sum()),
+            "relative volume": relative_volume,
+            "turnover trend %": turnover_trend_pct,
+        })
+
+    return pd.DataFrame(rows)
+
+
+liq_summary = _liquidity_summary(df, sessions=60)
+
+if liq_summary.empty:
+    st.info("Not enough data to calculate liquidity metrics yet.")
+else:
+    st.subheader("Market liquidity ranking")
+    st.caption(
+        "Sorted by 60-session average turnover. Average turnover includes zero/no-trade "
+        "sessions, which helps distinguish consistently liquid stocks from occasional "
+        "large trades. Trading days % is the share of those sessions with recorded activity."
+    )
+
+    liq_display = liq_summary.sort_values(
+        "60D avg turnover", ascending=False
+    ).reset_index(drop=True)
+    liq_display.insert(0, "rank", range(1, len(liq_display) + 1))
+
+    st.dataframe(
+        liq_display,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "20D avg turnover": st.column_config.NumberColumn(format="₮%.0f"),
+            "60D avg turnover": st.column_config.NumberColumn(format="₮%.0f"),
+            "20D avg volume": st.column_config.NumberColumn(format="%.0f"),
+            "60D avg volume": st.column_config.NumberColumn(format="%.0f"),
+            "trading days %": st.column_config.NumberColumn(format="%.1f%%"),
+            "relative volume": st.column_config.NumberColumn(format="%.2fx"),
+            "turnover trend %": st.column_config.NumberColumn(format="%+.1f%%"),
+        },
+    )
+
+    liquidity_ticker = st.selectbox(
+        "Select a ticker for liquidity detail",
+        all_tickers,
+        index=all_tickers.index(selected[0]) if selected and selected[0] in all_tickers else 0,
+        key="liquidity_ticker",
+    )
+
+    liq_row = liq_summary[liq_summary["ticker"] == liquidity_ticker].iloc[0]
+    lc1, lc2, lc3, lc4 = st.columns(4)
+    lc1.metric("20D avg turnover", _fmt_mnt(liq_row["20D avg turnover"]))
+    lc2.metric("60D avg turnover", _fmt_mnt(liq_row["60D avg turnover"]))
+    lc3.metric(
+        "Trading days (60 sessions)",
+        f"{liq_row['trading days %']:.1f}%",
+        f"{int(liq_row['zero/no-trade days'])} no-trade day(s)",
+    )
+    lc4.metric(
+        "Relative volume",
+        f"{liq_row['relative volume']:.2f}x"
+        if pd.notna(liq_row["relative volume"]) else "n/a",
+        "vs prior 20-session avg",
+    )
+
+    trend = liq_row["turnover trend %"]
+    if pd.notna(trend):
+        st.caption(
+            f"{liquidity_ticker}'s recent 20-session average turnover is "
+            f"{abs(trend):.1f}% {'higher' if trend >= 0 else 'lower'} than the preceding "
+            "20-session average."
+        )
+
+    liq_hist = df[
+        (df["ticker"] == liquidity_ticker)
+        & (df["date"] >= start)
+        & (df["date"] <= end)
+    ].sort_values("date")
+
+    if liq_hist.empty:
+        st.info(f"No liquidity history for {liquidity_ticker} in the selected date range.")
+    else:
+        st.subheader(f"{liquidity_ticker} — historical turnover")
+        turnover_fig = go.Figure()
+        turnover_fig.add_trace(go.Bar(
+            x=liq_hist["date"], y=liq_hist["value"], name="Daily turnover"
+        ))
+        turnover_fig.add_trace(go.Scatter(
+            x=liq_hist["date"],
+            y=liq_hist["value"].rolling(20, min_periods=1).mean(),
+            name="20-session average",
+            mode="lines",
+        ))
+        turnover_fig.update_layout(
+            height=350,
+            xaxis_title="Date",
+            yaxis_title="Turnover (MNT)",
+            margin=dict(l=10, r=10, t=30, b=10),
+        )
+        st.plotly_chart(turnover_fig, use_container_width=True)
+
+        st.subheader(f"{liquidity_ticker} — historical volume")
+        volume_fig = go.Figure()
+        volume_fig.add_trace(go.Bar(
+            x=liq_hist["date"], y=liq_hist["volume"], name="Daily volume"
+        ))
+        volume_fig.add_trace(go.Scatter(
+            x=liq_hist["date"],
+            y=liq_hist["volume"].rolling(20, min_periods=1).mean(),
+            name="20-session average",
+            mode="lines",
+        ))
+        volume_fig.update_layout(
+            height=350,
+            xaxis_title="Date",
+            yaxis_title="Shares traded",
+            margin=dict(l=10, r=10, t=30, b=10),
+        )
+        st.plotly_chart(volume_fig, use_container_width=True)
+
+    st.caption(
+        "Liquidity is multidimensional: turnover measures money traded, volume measures "
+        "shares traded, and trading-days % measures consistency. Bid–ask spread is not "
+        "included historically because the current price file does not contain historical "
+        "order-book snapshots."
+    )
+
+
 # ---- Stock Overview (52-week range, volume, moving averages) --------------
 
 st.header("Stock Overview")
