@@ -19,6 +19,13 @@ import requests
 BASE_URL = "https://members.mse.mn/en/company/{id}"
 BASE_URL_OPEN = "https://open.mse.mn/securities/{id}/tab/tradeinfo"
 MSE_TODAYS_TRADE_URL = "https://mse.mn/todays-trade"
+MSE_DAILY_REPORT_URL = "https://new.mse.mn/trade-daily-report"
+MSE_DAILY_REPORT_NEXT_ACTION = "7f0d1d329f47ce9833f71ab0ebbf7e41f053332094"
+MSE_DAILY_REPORT_ROUTER_STATE = (
+    '["",{"children":["(navbar)",{"children":["(trade)",{'
+    '"children":["trade-daily-report",{"children":["__PAGE__",{},null,null]}]},'
+    'null,null]},null,null]},null,null]},null,null,true]'
+)
 
 # Next.js Server Action used by mse.mn/todays-trade.
 # This can change when MSE deploys a new site build.
@@ -252,6 +259,133 @@ def fetch_todays_trade(timeout=TIMEOUT, retries=3, retry_backoff=2.0):
                 time.sleep(retry_backoff * (attempt + 1))
 
     return None
+
+
+def fetch_daily_orderbook(trading_date, timeout=TIMEOUT, retries=3, retry_backoff=2.0):
+    """Fetch new.mse.mn's historical daily-report order-book snapshot."""
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(trading_date)):
+        raise ValueError(f"Invalid trading date: {trading_date!r}")
+
+    headers = {
+        "Accept": "text/x-component",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Content-Type": "text/plain;charset=UTF-8",
+        "Next-Action": MSE_DAILY_REPORT_NEXT_ACTION,
+        "Next-Router-State-Tree": MSE_DAILY_REPORT_ROUTER_STATE,
+        "Origin": "https://new.mse.mn",
+        "Referer": MSE_DAILY_REPORT_URL,
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/151.0.0.0 Safari/537.36"
+        ),
+    }
+    payload = json.dumps([{
+        "url": "tradingHistoryCs1",
+        "parameter": f"?lang=mn&date={trading_date}",
+        "config": {"hasToken": False},
+    }], separators=(",", ":"))
+
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            response = requests.post(
+                MSE_DAILY_REPORT_URL,
+                headers=headers,
+                data=payload,
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            time.sleep(0.25)
+            return response.text
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                time.sleep(retry_backoff * (attempt + 1))
+
+    return None
+
+
+def _find_company_array(raw):
+    """Return the RSC JSON array containing companySymbol records."""
+    if not raw:
+        raise ValueError("Empty MSE RSC response")
+
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"(?m)^\d+:", raw):
+        start = match.end()
+        while start < len(raw) and raw[start].isspace():
+            start += 1
+        if start >= len(raw) or raw[start] != "[":
+            continue
+        try:
+            candidate, _ = decoder.raw_decode(raw[start:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, list) and any(
+            isinstance(item, dict) and "companySymbol" in item
+            for item in candidate
+        ):
+            return candidate
+
+    for match in re.finditer(r'\[\s*\{\s*"companySymbol"', raw):
+        try:
+            candidate, _ = decoder.raw_decode(raw[match.start():])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, list):
+            return candidate
+
+    raise ValueError("Could not find company data array in MSE RSC response")
+
+
+def parse_daily_orderbook(raw, trading_date):
+    """Parse an end-of-day daily-report snapshot for one trading date.
+
+    The bid/offer values are resting order-book values reported in the
+    snapshot. They are not executed prices or quantities.
+    """
+    rows = []
+    for item in _find_company_array(raw):
+        if not isinstance(item, dict) or not item.get("companySymbol"):
+            continue
+
+        ticker = str(item["companySymbol"]).strip()
+        if ticker == "JIV":
+            ticker = "AARD"
+
+        bid_qty = _optional_num(item.get("BuyOrderQty"))
+        bid = _optional_num(item.get("HighestBidPrice"))
+        ask_qty = _optional_num(item.get("SellOrderQty"))
+        ask = _optional_num(item.get("LowestOfferPrice"))
+
+        spread = None
+        spread_pct = None
+        quality = "ok"
+        if bid is None or bid <= 0:
+            quality = "missing_bid"
+        if ask is None or ask <= 0:
+            quality = "missing_ask" if quality == "ok" else "missing_bid_and_ask"
+        if bid is not None and bid > 0 and ask is not None and ask > 0:
+            spread = ask - bid
+            midpoint = (ask + bid) / 2.0
+            spread_pct = spread / midpoint * 100.0 if midpoint else None
+            if bid > ask:
+                quality = "crossed_book"
+
+        rows.append({
+            "ticker": ticker,
+            "date": str(trading_date),
+            "buy_order_qty": bid_qty,
+            "highest_bid": bid,
+            "sell_order_qty": ask_qty,
+            "lowest_offer": ask,
+            "spread": spread,
+            "spread_pct": spread_pct,
+            "quality_flag": quality,
+        })
+
+    return rows
 
 
 # ============================================================

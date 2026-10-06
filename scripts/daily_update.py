@@ -38,6 +38,8 @@ from scraper_lib import (  # noqa: E402
     parse_dividend_announcements,
     fetch_open,
     parse_open_page,
+    fetch_daily_orderbook,
+    parse_daily_orderbook,
 )
 
 # ================================================================
@@ -323,6 +325,19 @@ DIVIDENDS_CSV = os.path.join(
     "mse_dividends.csv",
 )
 
+ORDERBOOK_CSV = os.path.join(
+    os.path.dirname(__file__),
+    "..",
+    "data",
+    "mse_daily_orderbook.csv",
+)
+
+# Limit first-time historical backfill so one GitHub Actions run does not
+# make thousands of requests. Newest missing trading dates are filled first.
+ORDERBOOK_BACKFILL_DATES_PER_RUN = int(
+    os.environ.get("ORDERBOOK_BACKFILL_DATES_PER_RUN", "30")
+)
+
 
 FIELDNAMES = [
     "ticker",
@@ -364,6 +379,18 @@ DIVIDENDS_FIELDNAMES = [
     "company_name",
     "date",
     "headline",
+]
+
+ORDERBOOK_FIELDNAMES = [
+    "ticker",
+    "date",
+    "buy_order_qty",
+    "highest_bid",
+    "sell_order_qty",
+    "lowest_offer",
+    "spread",
+    "spread_pct",
+    "quality_flag",
 ]
 
 
@@ -520,6 +547,83 @@ def save_dividends(rows):
 
         for row in ordered:
             writer.writerow(row)
+
+
+def load_orderbook():
+    """Return dict of (ticker, date) -> EOD order-book snapshot."""
+    rows = {}
+    if os.path.exists(ORDERBOOK_CSV):
+        with open(ORDERBOOK_CSV, "r", newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                rows[(row["ticker"], row["date"])] = row
+    return rows
+
+
+def save_orderbook(rows):
+    os.makedirs(os.path.dirname(ORDERBOOK_CSV), exist_ok=True)
+    ordered = sorted(rows.values(), key=lambda r: (r["ticker"], r["date"]))
+    with open(ORDERBOOK_CSV, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=ORDERBOOK_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(ordered)
+
+
+def update_orderbook_history(master, ticker_ids):
+    """Incrementally backfill EOD order-book snapshots for stored price dates."""
+    orderbook = load_orderbook()
+    before = len(orderbook)
+
+    # Only dates actually present in our price master are requested, avoiding
+    # weekends/holidays. A date is considered complete when every target ticker
+    # that has a price row for that date has an order-book row (even if its
+    # bid/ask values are missing in MSE's snapshot).
+    price_tickers_by_date = {}
+    for ticker, date in master:
+        if ticker in ticker_ids and date:
+            price_tickers_by_date.setdefault(date, set()).add(ticker)
+
+    missing_dates = []
+    for date, expected_tickers in price_tickers_by_date.items():
+        stored_tickers = {
+            ticker for (ticker, stored_date) in orderbook if stored_date == date
+        }
+        if not expected_tickers.issubset(stored_tickers):
+            missing_dates.append(date)
+
+    missing_dates.sort(reverse=True)
+    batch = missing_dates[:ORDERBOOK_BACKFILL_DATES_PER_RUN]
+
+    print(
+        f"\nOrder-book history: {len(missing_dates)} trading dates missing; "
+        f"processing {len(batch)} this run."
+    )
+
+    succeeded = 0
+    failed = 0
+    for date in batch:
+        try:
+            raw = fetch_daily_orderbook(date)
+            if raw is None:
+                raise ValueError("empty response after retries")
+            rows = parse_daily_orderbook(raw, date)
+            target_rows = [r for r in rows if r["ticker"] in ticker_ids]
+            if not target_rows:
+                raise ValueError("response contained no target tickers")
+
+            for row in target_rows:
+                orderbook[(row["ticker"], date)] = row
+
+            succeeded += 1
+            print(f"  {date}: {len(target_rows)} target snapshots")
+        except Exception as exc:
+            failed += 1
+            print(f"  WARNING {date}: order-book snapshot failed: {exc}")
+
+    save_orderbook(orderbook)
+    print(
+        f"Order-book rows before: {before}, after: {len(orderbook)}; "
+        f"dates succeeded: {succeeded}, failed: {failed}."
+    )
 
 
 def latest_master_date(master, ticker):
@@ -951,6 +1055,17 @@ def main():
             f"WARNING: Today's Trade fallback failed: "
             f"{exc}"
         )
+
+    # ============================================================
+    # END-OF-DAY ORDER-BOOK HISTORY
+    # ============================================================
+    # Kept separate from OHLCV because these are resting best bid/offer
+    # snapshot values, not executed trades. Failure here must not affect
+    # the normal price updater.
+    try:
+        update_orderbook_history(master, ticker_ids)
+    except Exception as exc:
+        print(f"WARNING: order-book history update failed: {exc}")
 
     # ============================================================
     # SAVE
