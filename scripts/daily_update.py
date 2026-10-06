@@ -332,10 +332,17 @@ ORDERBOOK_CSV = os.path.join(
     "mse_daily_orderbook.csv",
 )
 
+ORDERBOOK_CHECKED_DATES_CSV = os.path.join(
+    os.path.dirname(__file__),
+    "..",
+    "data",
+    "mse_orderbook_checked_dates.csv",
+)
+
 # Limit first-time historical backfill so one GitHub Actions run does not
 # make thousands of requests. Newest missing trading dates are filled first.
 ORDERBOOK_BACKFILL_DATES_PER_RUN = int(
-    os.environ.get("ORDERBOOK_BACKFILL_DATES_PER_RUN", "30")
+    os.environ.get("ORDERBOOK_BACKFILL_DATES_PER_RUN", "150")
 )
 
 
@@ -568,61 +575,172 @@ def save_orderbook(rows):
         writer.writerows(ordered)
 
 
-def update_orderbook_history(master, ticker_ids):
-    """Incrementally backfill EOD order-book snapshots for stored price dates."""
+def load_orderbook_checked_dates():
+    """Return dict date -> status for dates conclusively checked at MSE."""
+    rows = {}
+    if os.path.exists(ORDERBOOK_CHECKED_DATES_CSV):
+        with open(ORDERBOOK_CHECKED_DATES_CSV, "r", newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if row.get("date"):
+                    rows[row["date"]] = row.get("status", "checked")
+    return rows
+
+
+def save_orderbook_checked_dates(rows):
+    os.makedirs(os.path.dirname(ORDERBOOK_CHECKED_DATES_CSV), exist_ok=True)
+    with open(ORDERBOOK_CHECKED_DATES_CSV, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["date", "status"])
+        writer.writeheader()
+        for date in sorted(rows, reverse=True):
+            writer.writerow({"date": date, "status": rows[date]})
+
+
+def orderbook_row_from_trade_row(row, trading_date):
+    """Convert a parsed Today's Trade row to our EOD snapshot schema."""
+    bid_qty = row.get("buy_order_qty")
+    bid = row.get("highest_bid")
+    ask_qty = row.get("sell_order_qty")
+    ask = row.get("lowest_offer")
+
+    spread = None
+    spread_pct = None
+    quality = "ok"
+    if bid is None or bid <= 0:
+        quality = "missing_bid"
+    if ask is None or ask <= 0:
+        quality = "missing_ask" if quality == "ok" else "missing_bid_and_ask"
+    if bid is not None and bid > 0 and ask is not None and ask > 0:
+        spread = ask - bid
+        midpoint = (ask + bid) / 2.0
+        spread_pct = spread / midpoint * 100.0 if midpoint else None
+        if bid > ask:
+            quality = "crossed_book"
+
+    return {
+        "ticker": row["ticker"],
+        "date": trading_date,
+        "buy_order_qty": bid_qty,
+        "highest_bid": bid,
+        "sell_order_qty": ask_qty,
+        "lowest_offer": ask,
+        "spread": spread,
+        "spread_pct": spread_pct,
+        "quality_flag": quality,
+    }
+
+
+def save_current_orderbook_snapshot(todays_date, todays_rows, ticker_ids):
+    """Save the post-close Today's Trade best bid/offer snapshot immediately."""
     orderbook = load_orderbook()
+    checked = load_orderbook_checked_dates()
+    saved = 0
+
+    for row in todays_rows:
+        ticker = row.get("ticker")
+        if ticker not in ticker_ids:
+            continue
+        # Only use a completed daily row. This prevents an intraday snapshot
+        # from being labelled as the EOD order book.
+        close = row.get("close")
+        if close is None or close <= 0:
+            continue
+        ob_row = orderbook_row_from_trade_row(row, todays_date)
+        orderbook[(ticker, todays_date)] = ob_row
+        saved += 1
+
+    if saved:
+        checked[todays_date] = "todays_trade_eod"
+        save_orderbook(orderbook)
+        save_orderbook_checked_dates(checked)
+        print(f"  Current EOD order book: {saved} target snapshots saved for {todays_date}")
+
+
+def update_orderbook_history(master, ticker_ids):
+    """Incrementally backfill historical EOD order-book snapshots."""
+    orderbook = load_orderbook()
+    checked = load_orderbook_checked_dates()
     before = len(orderbook)
 
-    # Only dates actually present in our price master are requested, avoiding
-    # weekends/holidays. A date is considered complete when every target ticker
-    # that has a price row for that date has an order-book row (even if its
-    # bid/ask values are missing in MSE's snapshot).
-    price_tickers_by_date = {}
-    for ticker, date in master:
-        if ticker in ticker_ids and date:
-            price_tickers_by_date.setdefault(date, set()).add(ticker)
+    # Bootstrap the ledger from snapshots collected by earlier versions of
+    # this updater, so upgrading does not re-request those dates.
+    for _, stored_date in orderbook:
+        checked.setdefault(stored_date, "existing_orderbook")
 
-    missing_dates = []
-    for date, expected_tickers in price_tickers_by_date.items():
-        stored_tickers = {
-            ticker for (ticker, stored_date) in orderbook if stored_date == date
-        }
-        if not expected_tickers.issubset(stored_tickers):
-            missing_dates.append(date)
-
-    missing_dates.sort(reverse=True)
-    batch = missing_dates[:ORDERBOOK_BACKFILL_DATES_PER_RUN]
+    # Work from dates that actually occur in the price master. A checked-date
+    # ledger prevents valid partial snapshots (e.g. only 17 target securities)
+    # and genuine no-data dates from being requested forever.
+    price_dates = sorted(
+        {date for (ticker, date) in master if ticker in ticker_ids and date},
+        reverse=True,
+    )
+    unchecked_dates = [date for date in price_dates if date not in checked]
+    batch = unchecked_dates[:ORDERBOOK_BACKFILL_DATES_PER_RUN]
 
     print(
-        f"\nOrder-book history: {len(missing_dates)} trading dates missing; "
-        f"processing {len(batch)} this run."
+        f"\nOrder-book history: {len(unchecked_dates)} price-history dates "
+        f"not yet checked; processing {len(batch)} this run."
     )
 
     succeeded = 0
+    no_data = 0
+    skipped_nonweekday = 0
     failed = 0
     for date in batch:
+        # A weekend date in the price master is not a normal MSE trading day.
+        # Record it as checked rather than making a pointless historical call.
+        try:
+            weekday = datetime.date.fromisoformat(date).weekday()
+        except ValueError:
+            failed += 1
+            print(f"  WARNING {date}: invalid date in price master")
+            continue
+        if weekday >= 5:
+            checked[date] = "non_weekday"
+            skipped_nonweekday += 1
+            print(f"  {date}: non-weekday; marked checked, no request sent")
+            continue
+
         try:
             raw = fetch_daily_orderbook(date)
             if raw is None:
                 raise ValueError("empty response after retries")
-            rows = parse_daily_orderbook(raw, date)
+            try:
+                rows = parse_daily_orderbook(raw, date)
+            except ValueError as exc:
+                # HTTP 200 with no company array is a conclusive no-data result
+                # for an older date, but today's history can lag publication.
+                today_ub = datetime.datetime.now(ULAANBAATAR_TZ).date().isoformat()
+                if date < today_ub and "Could not find company data array" in str(exc):
+                    checked[date] = "no_data"
+                    no_data += 1
+                    print(f"  {date}: no historical order-book data; marked checked")
+                    continue
+                raise
+
             target_rows = [r for r in rows if r["ticker"] in ticker_ids]
             if not target_rows:
-                raise ValueError("response contained no target tickers")
+                checked[date] = "no_target_rows"
+                no_data += 1
+                print(f"  {date}: response had no target snapshots; marked checked")
+                continue
 
             for row in target_rows:
                 orderbook[(row["ticker"], date)] = row
 
+            checked[date] = "historical_data"
             succeeded += 1
             print(f"  {date}: {len(target_rows)} target snapshots")
         except Exception as exc:
+            # Transient/request/parser failures remain unchecked and will retry.
             failed += 1
             print(f"  WARNING {date}: order-book snapshot failed: {exc}")
 
     save_orderbook(orderbook)
+    save_orderbook_checked_dates(checked)
     print(
         f"Order-book rows before: {before}, after: {len(orderbook)}; "
-        f"dates succeeded: {succeeded}, failed: {failed}."
+        f"dates with data: {succeeded}, no-data: {no_data}, "
+        f"non-weekday: {skipped_nonweekday}, retryable failures: {failed}."
     )
 
 
@@ -835,6 +953,9 @@ def main():
     # (e.g. from a pre-close run) once a real ClosingPrice is available.
     # ============================================================
 
+    todays_date = None
+    todays_rows = None
+
     try:
 
         print("\nChecking MSE Today's Trade...")
@@ -1043,6 +1164,11 @@ def main():
             f"{todays_skipped} already up to date, "
             f"{todays_rejected} rejected/skipped"
         )
+
+        # The same post-close response contains the best resting buy/sell
+        # orders. Save them as the current EOD order-book snapshot instead of
+        # waiting for tradingHistoryCs1 to publish today's historical report.
+        save_current_orderbook_snapshot(todays_date, todays_rows, ticker_ids)
 
     except MarketStillOpen as exc:
         print(f"  {exc}")
