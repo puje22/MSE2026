@@ -245,9 +245,31 @@ for ticker in selected:
         "90d_%": (lambda v: round(v, 2) if v is not None else None)(trailing_pct_change(tfull, 90)),
         "ytd_%": (lambda v: round(v, 2) if v is not None else None)(ytd_pct_change(tfull)),
         "volume": last_row["volume"],
+        "turnover_mnt": last_row.get("value", pd.NA),
+        "spread_%": (
+            round(
+                (last_row.get("lowest_offer") - last_row.get("highest_bid"))
+                / ((last_row.get("lowest_offer") + last_row.get("highest_bid")) / 2)
+                * 100,
+                2,
+            )
+            if pd.notna(last_row.get("highest_bid"))
+            and pd.notna(last_row.get("lowest_offer"))
+            and last_row.get("highest_bid", 0) > 0
+            and last_row.get("lowest_offer", 0) > 0
+            else pd.NA
+        ),
     })
 latest = pd.DataFrame(rows)
-st.dataframe(latest, use_container_width=True, hide_index=True)
+st.dataframe(
+    latest,
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "turnover_mnt": st.column_config.NumberColumn("turnover (MNT)", format="%,.0f"),
+        "spread_%": st.column_config.NumberColumn("spread %", format="%.2f%%"),
+    },
+)
 st.caption(
     "30d/90d/YTD % change are based on each ticker's full price history "
     "(not limited by the date-range filter above)."
